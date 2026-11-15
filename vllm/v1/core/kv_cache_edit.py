@@ -16,6 +16,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_request_block_hasher,
     hash_block_tokens,
 )
+from vllm.v1.core.patchkv import PatchKVPlan, plan_suffix_repair
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVQuantMode
 from vllm.v1.request import Request
 
@@ -32,6 +33,7 @@ class KVCacheEdit:
     suffix_ids: list[int] | None  # None reuses the source suffix KV.
     start: int
     end: int
+    recovery_plan: PatchKVPlan | None = None
 
 
 class KVCacheEditor:
@@ -139,9 +141,26 @@ class KVCacheEditor:
         write: Callable[[KVCacheEdit], object],
         *,
         recompute_suffix: bool = False,
+        repair_suffix_blocks: list[int] | None = None,
     ) -> str:
         if not 0 <= start <= end <= len(original_ids):
             raise ValueError("Expected 0 <= start <= end <= len(original_token_ids).")
+        if recompute_suffix and repair_suffix_blocks is not None:
+            raise ValueError(
+                "Choose full suffix recomputation or manual repair, not both."
+            )
+        recovery_plan = (
+            plan_suffix_repair(
+                len(original_ids),
+                start,
+                end,
+                len(replacement_ids),
+                self.block_size,
+                repair_suffix_blocks,
+            )
+            if repair_suffix_blocks is not None
+            else None
+        )
         original = self._request(original_ids, cache_salt)
         salt = self.salt_prefix + uuid4().hex
         edited = self._request(
@@ -172,9 +191,16 @@ class KVCacheEditor:
         self.pool.touch(source)
         allocated: list[KVCacheBlock] = []
         try:
-            allocated = self.pool.get_new_blocks(last - first)
-            destination = source[:first] + allocated + source[last:num_pages]
-            if first < last:
+            if recovery_plan is None:
+                allocated = self.pool.get_new_blocks(last - first)
+                destination = source[:first] + allocated + source[last:num_pages]
+            else:
+                allocated = self.pool.get_new_blocks(len(recovery_plan.private_blocks))
+                private = dict(zip(recovery_plan.private_blocks, allocated))
+                destination = [
+                    private[i] if i in private else source[i] for i in range(num_pages)
+                ]
+            if allocated:
                 write(
                     KVCacheEdit(
                         block_size=size,
@@ -182,9 +208,14 @@ class KVCacheEditor:
                         destination=[b.block_id for b in destination],
                         copy_end=min(last * size, edited.num_tokens),
                         replacement_ids=replacement_ids,
-                        suffix_ids=original_ids[end:] if recompute_suffix else None,
+                        suffix_ids=(
+                            original_ids[end:]
+                            if recompute_suffix or recovery_plan is not None
+                            else None
+                        ),
                         start=start,
                         end=end,
+                        recovery_plan=recovery_plan,
                     )
                 )
             for i, block in enumerate(destination):

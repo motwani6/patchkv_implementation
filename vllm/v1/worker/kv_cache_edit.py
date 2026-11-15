@@ -84,6 +84,7 @@ def _prefill(
             slot_mappings=slots,
             kv_cache_config=runner.kv_cache_config,
             positions=positions,
+            causal=True,
             is_prefilling=torch.tensor([True], device="cpu"),
         )
         with set_forward_context(
@@ -155,6 +156,32 @@ def write_kv_cache_edit(
         torch.tensor(pages, dtype=torch.long, device=runner.device)
         for pages in (edit.source, edit.destination)
     )
+    if edit.recovery_plan is not None:
+        plan = edit.recovery_plan
+        # Seed every reused dependency before running repair intervals causally.
+        for cache, rope in layers:
+            for mapping in plan.copies:
+                _copy_tokens(
+                    cache,
+                    rope,
+                    edit.block_size,
+                    source,
+                    destination,
+                    mapping.source_start,
+                    mapping.destination_start,
+                    mapping.count,
+                )
+        _prefill(runner, edit.replacement_ids, edit.start, destination, edit.block_size)
+        assert edit.suffix_ids is not None
+        for lo, hi in plan.repair_ranges:
+            _prefill(
+                runner,
+                edit.suffix_ids[lo - plan.suffix_start : hi - plan.suffix_start],
+                lo,
+                destination,
+                edit.block_size,
+            )
+        return
     # Whole prefix pages are shared. Seed the prefix in the first private page
     # for every layer before the replacement reads it.
     page_start = edit.start // edit.block_size * edit.block_size

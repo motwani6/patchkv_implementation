@@ -845,6 +845,7 @@ class LLM(
         *,
         cache_salt: str | None = None,
         recompute_suffix: bool = False,
+        repair_suffix_blocks: Sequence[int] | None = None,
     ) -> TokensPrompt:
         """Replace a token range in a resident prompt's cached KV.
 
@@ -863,6 +864,12 @@ class LLM(
             recompute_suffix: Run a separate causal prefill of the suffix against
                 the cached prefix and replacement. Defaults to False, which reuses
                 the suffix KV and corrects its keys if their positions shift.
+            repair_suffix_blocks: Manually repair these absolute logical block
+                indices in the edited context. Each block must intersect the
+                retained suffix. Noncontiguous blocks are supported; adjacent
+                blocks are coalesced. An empty sequence only reuses suffix KV.
+                Mutually exclusive with recompute_suffix=True. Repaired states
+                can depend on approximate reused KV earlier in the suffix.
 
         Returns:
             Edited token IDs and a fresh cache salt. Pass the returned prompt
@@ -883,7 +890,13 @@ class LLM(
             else []
         )
         salt = self.llm_engine.engine_core.edit_kv_cache(
-            original, replacement, start, end, cache_salt, recompute_suffix
+            original,
+            replacement,
+            start,
+            end,
+            cache_salt,
+            recompute_suffix,
+            list(repair_suffix_blocks) if repair_suffix_blocks is not None else None,
         )
         return {
             "prompt_token_ids": original[:start] + replacement + original[end:],

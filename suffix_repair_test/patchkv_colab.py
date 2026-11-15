@@ -1,0 +1,334 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Small, fail-fast GPU validation; see COLAB_PATCHKV.md for setup."""
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import subprocess
+import sys
+import traceback
+from datetime import UTC, datetime
+from pathlib import Path
+from uuid import uuid4
+
+
+def command(*args):
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, check=False)
+    except OSError as error:
+        return {"returncode": None, "stdout": "", "stderr": str(error)}
+    return {
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def save(path, report):
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def validate(args, report, persist):
+    import torch
+
+    report["torch"] = torch.__version__
+    report["torch_cuda"] = torch.version.cuda
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA unavailable; select a Colab GPU runtime.")
+    capability = torch.cuda.get_device_capability()
+    report["gpu"] = torch.cuda.get_device_name()
+    report["capability"] = capability
+    report["compiled_arches"] = torch.cuda.get_arch_list()
+    if capability < (7, 5):
+        raise RuntimeError("This checkout requires compute capability >= 7.5.")
+    # Exercise allocation, a CUDA library, and synchronization before model load.
+    x = torch.ones((16, 16), device="cuda", dtype=torch.float16)
+    if (x @ x)[0, 0].item() != 16:
+        raise RuntimeError("CUDA matmul smoke check failed.")
+    torch.cuda.synchronize()
+    import vllm._C  # noqa: F401
+
+    import vllm
+    from vllm import LLM, SamplingParams
+    from vllm.v1.core.patchkv import plan_suffix_repair
+
+    root = Path(__file__).resolve().parents[1]
+    report["vllm"] = {"version": vllm.__version__, "path": vllm.__file__}
+    if Path(vllm.__file__).resolve().parent != root / "vllm":
+        raise RuntimeError("Imported vLLM is not this modified checkout.")
+    persist()
+    if args.preflight_only:
+        return
+    config = dict(
+        model=args.model,
+        revision=args.revision,
+        enforce_eager=True,
+        dtype="float16",
+        max_model_len=192,
+        max_num_seqs=1,
+        max_num_batched_tokens=32,
+        block_size=16,
+        enable_prefix_caching=True,
+        kv_cache_memory_bytes=32 << 20,
+        gpu_memory_utilization=0.6,
+        attention_config={"backend": "TRITON_ATTN"},
+    )
+    report["requested_config"] = config
+    persist()
+    llm = LLM(**config)
+    try:
+        core = llm.llm_engine.engine_core.engine_core
+        manager = core.scheduler.kv_cache_manager
+        editor = manager.editor
+        if editor is None:
+            raise RuntimeError("KV editor disabled by effective configuration.")
+        worker = core.model_executor.driver_worker
+        model = worker.get_model()
+        context = worker.vllm_config.compilation_config.static_forward_context
+        report["effective_config"] = str(worker.vllm_config)
+        report["runner"] = type(worker.model_runner).__name__
+        report["model_commit"] = getattr(
+            worker.vllm_config.model_config.hf_config, "_commit_hash", None
+        )
+        params = SamplingParams(max_tokens=2, temperature=0, ignore_eos=True)
+        warmup = SamplingParams(max_tokens=1, temperature=0, ignore_eos=True)
+        tokenizer = llm.get_tokenizer()
+        original = tokenizer.encode(
+            "Remember the color blue. Count the small birds in the garden. " * 12,
+            add_special_tokens=False,
+        )[:83]
+        if len(original) != 83:
+            raise RuntimeError("Expected an 83-token test context.")
+
+        def generate(prompt, sampling=warmup):
+            return llm.generate(prompt, sampling, use_tqdm=False)[0]
+
+        def snapshot(ids, salt):
+            request = editor._request(ids, salt)
+            pages = []
+            for pos in range(0, len(ids), editor.block_size):
+                end = min(pos + editor.block_size, len(ids))
+                hit = editor.pool.get_cached_block(editor._hash_at(request, end), [0])
+                if hit is None:
+                    raise RuntimeError(f"Source evicted or unpublished at {end}.")
+                pages.append(hit[0])
+            states = {}
+            for name in manager.kv_cache_config.kv_cache_groups[0].layer_names:
+                cache = context[name].kv_cache
+                if cache.ndim != 4:
+                    raise RuntimeError(
+                        f"Unsupported cache layout: {name}: {cache.shape}"
+                    )
+                states[name] = torch.cat(
+                    [cache[b.block_id].transpose(0, 1) for b in pages]
+                )[: len(ids)].clone()
+            return states, pages
+
+        def compare(actual, expected, exact=False):
+            maximum = 0.0
+            for name in expected:
+                maximum = max(
+                    maximum, (actual[name] - expected[name]).abs().max().item()
+                )
+                torch.testing.assert_close(
+                    actual[name],
+                    expected[name],
+                    atol=0 if exact else args.atol,
+                    rtol=0 if exact else args.rtol,
+                    msg=lambda msg, name=name: f"{name}: {msg}",
+                )
+            return maximum
+
+        for label, start, end, text in (
+            ("replacement", 19, 23, " red green"),
+            ("insertion", 19, 19, " red green"),
+            ("deletion", 19, 23, ""),
+        ):
+            row = {"case": label, "status": "running", "modes": []}
+            report["cases"].append(row)
+            replacement = tokenizer.encode(text) if text else []
+            if label == "replacement":
+                end = start + len(replacement)
+            edited_ids = original[:start] + replacement + original[end:]
+            suffix_start = start + len(replacement)
+            blocks = sorted({p // 16 for p in range(suffix_start, len(edited_ids))})
+            selected = [blocks[0], blocks[-1]]
+            row.update(
+                original_ids=original,
+                replacement_ids=replacement,
+                edited_ids=edited_ids,
+                start=start,
+                end=end,
+                shift=len(replacement) - (end - start),
+                selected=selected,
+            )
+            persist()
+            # Unique salts ensure the reference starts with no cached context.
+            fresh_salt, source_salt = uuid4().hex, uuid4().hex
+            fresh_output = generate(
+                {"prompt_token_ids": edited_ids, "cache_salt": fresh_salt}
+            )
+            if fresh_output.num_cached_tokens != 0:
+                raise AssertionError("Fresh reference unexpectedly hit the cache.")
+            fresh, _ = snapshot(edited_ids, fresh_salt)
+            generate({"prompt_token_ids": original, "cache_salt": source_salt})
+            before, source = snapshot(original, source_salt)
+            editor.pool.touch(source)
+            try:
+                for mode, options in (
+                    ("full", {"recompute_suffix": True}),
+                    ("all_blocks", {"repair_suffix_blocks": blocks}),
+                    ("selective", {"repair_suffix_blocks": selected}),
+                    ("direct", {}),
+                ):
+                    item = {"mode": mode, "status": "running"}
+                    row["modes"].append(item)
+                    persist()
+                    forwards = []
+
+                    def record(module, inputs, kwargs, forwards=forwards):
+                        forwards.extend(kwargs["positions"].tolist())
+
+                    with model.register_forward_pre_hook(record, with_kwargs=True):
+                        prompt = llm.edit_kv_cache(
+                            original,
+                            text,
+                            start,
+                            end,
+                            cache_salt=source_salt,
+                            **options,
+                        )
+                    actual, _ = snapshot(edited_ids, prompt["cache_salt"])
+                    plan = plan_suffix_repair(
+                        len(original),
+                        start,
+                        end,
+                        len(replacement),
+                        16,
+                        blocks
+                        if mode in ("full", "all_blocks")
+                        else selected
+                        if mode == "selective"
+                        else [],
+                    )
+                    expected_positions = list(range(start, suffix_start))
+                    expected_positions += [
+                        p for lo, hi in plan.repair_ranges for p in range(lo, hi)
+                    ]
+                    item["forward_positions"] = forwards
+                    if forwards != expected_positions:
+                        raise AssertionError("Unexpected recomputation positions.")
+                    if mode in ("full", "all_blocks"):
+                        item["max_abs_error_vs_fresh"] = compare(actual, fresh)
+                    reused = [
+                        p
+                        for p in range(suffix_start, len(edited_ids))
+                        if p // 16 in plan.reuse_blocks
+                    ]
+                    # Independent complex-number RoPE reference (Qwen2 NeoX).
+                    for name, kv in actual.items():
+                        torch.testing.assert_close(
+                            kv[:start], before[name][:start], atol=0, rtol=0
+                        )
+                        if not reused:
+                            continue
+                        rope = model.get_submodule(name.rsplit(".", 1)[0]).rotary_emb
+                        if not rope.is_neox_style or rope.rotary_dim != rope.head_size:
+                            raise RuntimeError("Test oracle requires full NeoX RoPE.")
+                        new = torch.tensor(reused, device=kv.device)
+                        old = new - row["shift"]
+                        head = rope.head_size
+                        src = before[name][old]
+                        dst = kv[new]
+                        torch.testing.assert_close(
+                            dst[..., head:], src[..., head:], atol=0, rtol=0
+                        )
+                        phase = torch.complex(*rope.cos_sin_cache.float().chunk(2, -1))
+                        key = torch.complex(*src[..., :head].float().chunk(2, -1))
+                        moved = key * (phase[new] / phase[old])[:, None, :]
+                        expected = torch.cat((moved.real, moved.imag), -1)
+                        torch.testing.assert_close(
+                            dst[..., :head].float(), expected, atol=0.005, rtol=0.002
+                        )
+                    source_after, _ = snapshot(original, source_salt)
+                    compare(source_after, before, exact=True)
+                    output = generate(prompt, params)
+                    item["generated_ids"] = output.outputs[0].token_ids
+                    item["generated_text"] = output.outputs[0].text
+                    item["cached_tokens"] = output.num_cached_tokens
+                    if len(item["generated_ids"]) != 2:
+                        raise AssertionError("Generation did not complete two tokens.")
+                    if output.num_cached_tokens != len(edited_ids) - 1:
+                        raise AssertionError("Edited prompt did not reuse expected KV.")
+                    item["status"] = "passed"
+                    persist()
+            finally:
+                editor.pool.free_blocks(source)
+            row["status"] = "passed"
+            persist()
+        torch.cuda.synchronize()
+        report["peak_allocated_bytes"] = torch.cuda.max_memory_allocated()
+    finally:
+        llm.llm_engine.engine_core.shutdown()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument(
+        "--revision", default="c89bee90d9f811437d9735454613c35b4a3c4dc8"
+    )
+    parser.add_argument("--results-dir", type=Path, required=True)
+    parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--atol", type=float, default=0.03)
+    parser.add_argument("--rtol", type=float, default=0.03)
+    args = parser.parse_args()
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    args.results_dir.mkdir(parents=True, exist_ok=True)
+    path = args.results_dir / "results.json"
+    if path.exists():
+        parser.error("Use a new results directory to preserve earlier results.")
+    report = {
+        "status": "running",
+        "cases": [],
+        "python": sys.version,
+        "platform": platform.platform(),
+        "started": datetime.now(UTC).isoformat(),
+        "git_head": command("git", "rev-parse", "HEAD"),
+        "git_status": command("git", "status", "--short"),
+        "nvidia_smi": command("nvidia-smi"),
+        "tolerances": {"atol": args.atol, "rtol": args.rtol},
+    }
+    root = Path(__file__).resolve().parents[1]
+    report["source_sha256"] = {
+        str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in [
+            root / "vllm/v1/core/patchkv.py",
+            root / "vllm/v1/core/kv_cache_edit.py",
+            root / "vllm/v1/worker/kv_cache_edit.py",
+            Path(__file__),
+        ]
+    }
+    persist = lambda: save(path, report)
+    persist()
+    try:
+        validate(args, report, persist)
+        report["status"] = "preflight_passed" if args.preflight_only else "passed"
+    except Exception:
+        report["status"] = "failed"
+        report["traceback"] = traceback.format_exc()
+        raise
+    finally:
+        report["finished"] = datetime.now(UTC).isoformat()
+        persist()
+        print(f"Results: {path} ({report['status']})", flush=True)
+
+
+if __name__ == "__main__":
+    main()
