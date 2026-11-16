@@ -15,7 +15,6 @@ from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
     build_slot_mappings_by_layer,
 )
-from vllm.v1.worker.utils import prepare_kernel_block_sizes
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
@@ -53,13 +52,8 @@ def _prefill(
     model = runner.get_model()
     ids = torch.tensor(token_ids, dtype=torch.long, device=device)
     pages = pages[: cdiv(start_pos + len(token_ids), block_size)].int()
-    (kernel_size,) = prepare_kernel_block_sizes(
-        runner.kv_cache_config, runner.attn_groups
-    )
-    ratio = block_size // kernel_size
-    table = (
-        pages[:, None] * ratio + torch.arange(ratio, dtype=pages.dtype, device=device)
-    ).reshape(1, -1)
+    # AttentionGroup maps manager pages to kernel pages when building metadata.
+    table = pages.reshape(1, -1)
     chunk_size = runner.vllm_config.scheduler_config.max_num_batched_tokens
     for chunk in ids.split(chunk_size):
         count = chunk.numel()
@@ -130,6 +124,8 @@ def write_kv_cache_edit(
     context = runner.vllm_config.compilation_config.static_forward_context
     layers = []
     for group in runner.attn_groups[0]:
+        if getattr(group, "kernel_block_stride", 0):
+            raise ValueError("KV editing does not support packed kernel-block strides.")
         for name in group.layer_names:
             parent = model.get_submodule(name.rsplit(".", 1)[0])
             rope = getattr(parent, "rotary_emb", None)

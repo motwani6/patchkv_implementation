@@ -1,7 +1,13 @@
 # Manual PatchKV repair
 
-This stage implements resident-KV manual repair only. There is no learned drift
-policy, attention selection, CPU offload, or quantization.
+Phase 1 implements resident-KV manual repair. Phase 2 adds offline drift profiling,
+length prediction, and predicted-window planning; see [the Phase 2 guide](PATCHKV_PHASE2.md).
+Phase 3 adds checkpoint-time attention scoring and guided repair; see
+[the Phase 3 guide](PATCHKV_PHASE3.md). Phase 4 adds bounded full-precision CPU
+checkpoints and eviction-independent restore through `LLM.edit_kv_cache`;
+see [the Phase 4 guide](PATCHKV_PHASE4.md). Phase 5 adds packed mixed-precision
+checkpoint transport and quality-calibration tools; see
+[the Phase 5 guide](PATCHKV_PHASE5.md). No model policy has been quality-calibrated locally.
 
 ## API
 
@@ -81,6 +87,13 @@ installed (the first missing dependency was NumPy). Its independent RoPE/copy
 numerical test passed through the isolated CPU tensor suite. No GPU was used.
 
 ## Later Colab validation
+
+Phase 6 adds a real CPU causal-model integration harness and a consolidated
+plan-only/Colab workflow for Phases 1–5. See
+[PATCHKV_PHASE6.md](PATCHKV_PHASE6.md) for the audit fixes, all-mode benchmarks,
+real-model calibration inputs, held-out task splits and remaining limitations.
+The earlier test counts below describe Phase 1; use unittest discovery above
+for the current complete suite. No Colab execution has been performed locally.
 
 Use [the minimal Colab smoke guide](COLAB_PATCHKV.md) and
 `patchkv_colab.py` for the first GPU session. The overlay helper transfers the

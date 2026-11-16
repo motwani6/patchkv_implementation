@@ -917,6 +917,16 @@ class EngineCore:
         recompute_suffix: bool = False,
         repair_suffix_blocks: list[int] | None = None,
     ) -> str:
+        if getattr(self.scheduler, "has_unfinished_requests", lambda: False)():
+            raise RuntimeError("KV editing requires an idle engine.")
+        if (
+            type(start) is not int
+            or type(end) is not int
+            or not 0 <= start <= end <= len(original_ids)
+        ):
+            raise ValueError(
+                "Expected integer bounds 0 <= start <= end <= original length."
+            )
         manager = getattr(self.scheduler, "kv_cache_manager", None)
         editor = getattr(manager, "editor", None)
         if editor is None:
@@ -929,10 +939,11 @@ class EngineCore:
         if max(length, len(original_ids)) > config.max_model_len:
             raise ValueError("The original or edited prompt exceeds max_model_len.")
         vocab_size = config.get_vocab_size()
-        if any(t < 0 or t >= vocab_size for t in replacement_ids):
-            raise ValueError(
-                "Replacement contains a token outside the model vocabulary."
-            )
+        if any(
+            type(t) is not int or t < 0 or t >= vocab_size
+            for t in (*original_ids, *replacement_ids)
+        ):
+            raise ValueError("Original/replacement contains an invalid model token.")
         return editor.edit(
             original_ids,
             replacement_ids,

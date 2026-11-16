@@ -1,5 +1,9 @@
 # Colab PatchKV smoke validation
 
+For the consolidated Phase 1–5 validation, calibration and small held-out
+benchmark workflow, see [PATCHKV_PHASE6.md](PATCHKV_PHASE6.md). The setup below
+still applies; the consolidated script defaults to planning without GPU use.
+
 No GPU results have been collected by these files. This is a correctness smoke
 test, not a latency benchmark. Use one Colab session and stop on the first error.
 
@@ -34,9 +38,9 @@ test, not a latency benchmark. Use one Colab session and stop on the first error
 
 The existing worker RPC synchronizes the device before and after editing, pins
 source pages, and publishes destination pages after successful execution.
-Selective repair seeds reused dependencies before causal prefills. No additional
-obvious integration defect was identified by static review; these assumptions
-remain unvalidated on GPU.
+Selective repair seeds reused dependencies before causal prefills. The Phase 6
+CPU audit fixed duplicate manager/kernel block mapping and added lifecycle and
+policy compatibility checks; CUDA behavior remains unvalidated.
 
 ## Transfer this uncommitted implementation
 

@@ -64,6 +64,7 @@ class KVCacheEditor:
             or config.speculative_config is not None
             or config.lora_config is not None
             or parallel.data_parallel_size != 1
+            or parallel.tensor_parallel_size != 1
             or parallel.pipeline_parallel_size != 1
             or parallel.decode_context_parallel_size != 1
             or parallel.prefill_context_parallel_size != 1

@@ -54,6 +54,10 @@ from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.sample.logits_processor import LogitsProcessor
 
 if TYPE_CHECKING:
+    from vllm.entrypoints.patchkv import KVCheckpointHandle
+    from vllm.v1.core.patchkv_attention import AttentionBudget, AttentionMetadata
+    from vllm.v1.core.patchkv_precision import PrecisionPolicy
+    from vllm.v1.core.patchkv_profile import DriftProfile
     from vllm.v1.metrics.reader import Metric
 
 logger = init_logger(__name__)
@@ -846,12 +850,16 @@ class LLM(
         cache_salt: str | None = None,
         recompute_suffix: bool = False,
         repair_suffix_blocks: Sequence[int] | None = None,
+        checkpoint: "KVCheckpointHandle | None" = None,
+        drift_profile: "DriftProfile | None" = None,
+        attention_budget: "AttentionBudget | None" = None,
     ) -> TokensPrompt:
         """Replace a token range in a resident prompt's cached KV.
 
         The replacement attends to the cached prefix at its final positions.
         Uses the local GPU prefix cache of a dense, causal 1D RoPE decoder.
-        Source pages must still be resident and changed pages use the same pool.
+        Source pages must be resident unless a CPU checkpoint is supplied.
+        Changed pages use the same local pool.
 
         Args:
             original_token_ids: Exact token IDs of the cached text prompt,
@@ -870,6 +878,12 @@ class LLM(
                 blocks are coalesced. An empty sequence only reuses suffix KV.
                 Mutually exclusive with recompute_suffix=True. Repaired states
                 can depend on approximate reused KV earlier in the suffix.
+            checkpoint: Optional CPU checkpoint created by create_kv_checkpoint.
+                Restores into fresh pages even if the original KV was evicted.
+            drift_profile: Frozen Phase 2 profile for checkpoint recovery.
+                Mutually exclusive with manual or full-suffix repair.
+            attention_budget: Optional Phase 3 token-selection budget, requiring
+                drift_profile and checkpoint attention metadata.
 
         Returns:
             Edited token IDs and a fresh cache salt. Pass the returned prompt
@@ -889,19 +903,85 @@ class LLM(
             if new_tokens
             else []
         )
-        salt = self.llm_engine.engine_core.edit_kv_cache(
-            original,
-            replacement,
-            start,
-            end,
-            cache_salt,
-            recompute_suffix,
-            list(repair_suffix_blocks) if repair_suffix_blocks is not None else None,
-        )
+        if checkpoint is not None:
+            salt = checkpoint.restore(
+                self,
+                original,
+                replacement,
+                start,
+                end,
+                cache_salt=cache_salt,
+                recompute_suffix=recompute_suffix,
+                repair_suffix_blocks=repair_suffix_blocks,
+                drift_profile=drift_profile,
+                attention_budget=attention_budget,
+            )
+        else:
+            if drift_profile is not None or attention_budget is not None:
+                raise ValueError("Predicted recovery requires a CPU checkpoint handle.")
+            salt = self.llm_engine.engine_core.edit_kv_cache(
+                original,
+                replacement,
+                start,
+                end,
+                cache_salt,
+                recompute_suffix,
+                list(repair_suffix_blocks)
+                if repair_suffix_blocks is not None
+                else None,
+            )
         return {
             "prompt_token_ids": original[:start] + replacement + original[end:],
             "cache_salt": salt,
         }
+
+    def create_kv_checkpoint(
+        self,
+        original_token_ids: Sequence[int],
+        *,
+        model_key: str,
+        cache_salt: str | None = None,
+        max_cpu_bytes: int | None = None,
+        attention: "AttentionMetadata | None" = None,
+        precision_policy: "PrecisionPolicy | None" = None,
+        protected_prefix_tokens: int = 0,
+    ) -> "KVCheckpointHandle":
+        """Copy resident KV to bounded CPU storage and return an owned handle.
+
+        Args:
+            original_token_ids: Exact original prompt tokens.
+            model_key: Model/revision/configuration identity used by profiles.
+            cache_salt: Original prompt cache salt.
+            max_cpu_bytes: Per-LLM managed budget, fixed on first use (256 MiB
+                by default). Omit on later calls to reuse the existing budget.
+            attention: Optional matching Phase 3 importance metadata.
+            precision_policy: Optional frozen Phase 5 transport policy. Omitting
+                this retains source-precision CPU storage unchanged.
+            protected_prefix_tokens: Keep blocks intersecting this prefix in
+                FP16 for exact prefix restoration. Requires precision_policy.
+
+        Returns:
+            A checkpoint handle with immutable metadata and explicit release().
+
+        """
+        session = getattr(self, "_patchkv_checkpoint_session", None)
+        if session is None:
+            from vllm.entrypoints.patchkv import KVCheckpointSession
+
+            session = KVCheckpointSession(
+                self, max_cpu_bytes if max_cpu_bytes is not None else 256 << 20
+            )
+            self._patchkv_checkpoint_session = session
+        elif max_cpu_bytes is not None and session.store.max_bytes != max_cpu_bytes:
+            raise ValueError("The per-LLM checkpoint budget is fixed on first use.")
+        return session.create(
+            original_token_ids,
+            cache_salt=cache_salt,
+            model_key=model_key,
+            attention=attention,
+            precision_policy=precision_policy,
+            protected_prefix_tokens=protected_prefix_tokens,
+        )
 
     def sleep(self, level: int = 1, mode: PauseMode = "abort"):
         """Put the engine to sleep. The engine should not process any requests.

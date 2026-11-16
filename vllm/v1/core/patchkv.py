@@ -2,8 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Dependency-free planning for manual, resident-KV suffix repair."""
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vllm.v1.core.patchkv_attention import AttentionBudget, AttentionMetadata
+    from vllm.v1.core.patchkv_profile import DriftProfile
 
 
 @dataclass(frozen=True)
@@ -130,4 +137,100 @@ def plan_suffix_repair(
         private_blocks=tuple(private),
         repair_ranges=tuple(ranges),
         copies=tuple(copies),
+    )
+
+
+def plan_profiled_suffix_repair(
+    original_length: int,
+    start: int,
+    end: int,
+    replacement_length: int,
+    block_size: int,
+    profile: DriftProfile,
+    *,
+    model_key: str,
+    additional_repair_suffix_blocks: Sequence[int] = (),
+) -> PatchKVPlan:
+    """Predict a local window, union extra blocks, then use the Phase 1 planner.
+
+    Args:
+        original_length: Original context token count.
+        start: Inclusive edit start.
+        end: Exclusive edit end.
+        replacement_length: New middle-span token count.
+        block_size: Execution page size, which must match calibration.
+        profile: Frozen offline drift artifact.
+        model_key: Exact model/revision/configuration identity used in calibration.
+        additional_repair_suffix_blocks: Optional manual or attention-selected
+            absolute new-context blocks to union with the predicted local window.
+
+    Returns:
+        A normal Phase 1 plan, including copy-on-write mappings and causal ranges.
+
+    """
+    if profile.config.model_key != model_key or profile.config.block_size != block_size:
+        raise ValueError("Drift profile model identity or block size does not match.")
+    base = plan_suffix_repair(
+        original_length,
+        start,
+        end,
+        replacement_length,
+        block_size,
+        additional_repair_suffix_blocks,
+    )
+    dirty = profile.predict(start, replacement_length, original_length - end)
+    selected = set(base.repair_blocks)
+    if dirty:
+        selected.update(
+            range(
+                base.suffix_start // block_size,
+                (base.suffix_start + dirty + block_size - 1) // block_size,
+            )
+        )
+    return plan_suffix_repair(
+        original_length, start, end, replacement_length, block_size, sorted(selected)
+    )
+
+
+def plan_attention_guided_suffix_repair(
+    original_ids: Sequence[int],
+    start: int,
+    end: int,
+    replacement_length: int,
+    block_size: int,
+    profile: DriftProfile,
+    attention: AttentionMetadata,
+    budget: AttentionBudget,
+    *,
+    model_key: str,
+    checkpoint_id: str,
+) -> PatchKVPlan:
+    """Fix BlockRound(D union H) from checkpoint scores before reconstruction."""
+    attention.validate_context(
+        original_ids,
+        model_key=model_key,
+        block_size=block_size,
+        checkpoint_id=checkpoint_id,
+    )
+    # Validate edit bounds/profile identity before asking the predictor to run.
+    plan_suffix_repair(
+        len(original_ids), start, end, replacement_length, block_size, ()
+    )
+    if profile.config.model_key != model_key or profile.config.block_size != block_size:
+        raise ValueError("Drift profile model identity or block size does not match.")
+    dirty = profile.predict(start, replacement_length, len(original_ids) - end)
+    offsets = attention.select_suffix_offsets(end, dirty, budget)
+    suffix_start = start + replacement_length
+    # Union at token granularity; do not remove attention candidates merely
+    # because their page also contains a dirty token.
+    blocks = {(suffix_start + offset) // block_size for offset in offsets}
+    if dirty:
+        blocks.update(
+            range(
+                suffix_start // block_size,
+                (suffix_start + dirty + block_size - 1) // block_size,
+            )
+        )
+    return plan_suffix_repair(
+        len(original_ids), start, end, replacement_length, block_size, sorted(blocks)
     )

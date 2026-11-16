@@ -55,7 +55,13 @@ def validate(args, report, persist):
 
     import vllm
     from vllm import LLM, SamplingParams
-    from vllm.v1.core.patchkv import plan_suffix_repair
+    from vllm.v1.core.patchkv import (
+        plan_attention_guided_suffix_repair,
+        plan_profiled_suffix_repair,
+        plan_suffix_repair,
+    )
+    from vllm.v1.core.patchkv_attention import AttentionBudget, AttentionMetadata
+    from vllm.v1.core.patchkv_profile import DriftProfile
 
     root = Path(__file__).resolve().parents[1]
     report["vllm"] = {"version": vllm.__version__, "path": vllm.__file__}
@@ -64,6 +70,19 @@ def validate(args, report, persist):
     persist()
     if args.preflight_only:
         return
+    drift_profile = (
+        DriftProfile.load(args.drift_profile) if args.drift_profile else None
+    )
+    model_key = f"{args.model}@{args.revision};fp16;TRITON_ATTN;maxlen=192"
+    if drift_profile is not None and (
+        drift_profile.config.model_key != model_key
+        or drift_profile.config.block_size != 16
+    ):
+        raise ValueError("Drift profile does not match this smoke-test configuration.")
+    if drift_profile is not None:
+        report["drift_profile"] = json.loads(
+            args.drift_profile.read_text(encoding="utf-8")
+        )
     config = dict(
         model=args.model,
         revision=args.revision,
@@ -176,16 +195,107 @@ def validate(args, report, persist):
             if fresh_output.num_cached_tokens != 0:
                 raise AssertionError("Fresh reference unexpectedly hit the cache.")
             fresh, _ = snapshot(edited_ids, fresh_salt)
-            generate({"prompt_token_ids": original, "cache_salt": source_salt})
+            attention = None
+            if args.attention_fraction is None:
+                generate({"prompt_token_ids": original, "cache_salt": source_salt})
+            else:
+                from vllm.v1.worker.patchkv_attention import (
+                    CheckpointAttentionCollector,
+                )
+
+                names = manager.kv_cache_config.kv_cache_groups[0].layer_names
+                sampled = args.attention_layers or [
+                    names[i] for i in sorted({0, len(names) // 2, len(names) - 1})
+                ]
+                query_positions = args.attention_query_positions or [len(original) - 1]
+                if max(query_positions) >= 190:
+                    raise ValueError("Attention probes must fit the 192-token context.")
+                capture = CheckpointAttentionCollector(
+                    worker.model_runner,
+                    original,
+                    model_key=model_key,
+                    checkpoint_id=source_salt,
+                    block_size=16,
+                    layer_names=sampled,
+                    query_positions=query_positions,
+                )
+                probe_tokens = max(1, max(query_positions) - len(original) + 2)
+                with capture:
+                    probe_output = generate(
+                        {"prompt_token_ids": original, "cache_salt": source_salt},
+                        SamplingParams(
+                            max_tokens=probe_tokens, temperature=0, ignore_eos=True
+                        ),
+                    )
+                captured = capture.finalize()
+                attention_path = args.results_dir / f"attention-{label}.json"
+                captured.save(attention_path)
+                attention = AttentionMetadata.load(attention_path)
+                attention.validate_context(
+                    original,
+                    model_key=model_key,
+                    block_size=16,
+                    checkpoint_id=source_salt,
+                    layers=captured.layers,
+                    query_positions=captured.query_positions,
+                )
+                row["attention_metadata"] = attention_path.name
+                row["attention_probe_generated_ids"] = probe_output.outputs[0].token_ids
+                persist()
             before, source = snapshot(original, source_salt)
             editor.pool.touch(source)
             try:
-                for mode, options in (
+                modes = [
                     ("full", {"recompute_suffix": True}),
                     ("all_blocks", {"repair_suffix_blocks": blocks}),
                     ("selective", {"repair_suffix_blocks": selected}),
                     ("direct", {}),
-                ):
+                ]
+                if drift_profile is not None:
+                    predicted = plan_profiled_suffix_repair(
+                        len(original),
+                        start,
+                        end,
+                        len(replacement),
+                        16,
+                        drift_profile,
+                        model_key=model_key,
+                    )
+                    modes.append(
+                        ("predicted", {"repair_suffix_blocks": predicted.repair_blocks})
+                    )
+                    row["predicted_dirty_tokens"] = drift_profile.predict(
+                        start, len(replacement), len(original) - end
+                    )
+                    if attention is not None:
+                        budget = AttentionBudget(fraction=args.attention_fraction)
+                        guided = plan_attention_guided_suffix_repair(
+                            original,
+                            start,
+                            end,
+                            len(replacement),
+                            16,
+                            drift_profile,
+                            attention,
+                            budget,
+                            model_key=model_key,
+                            checkpoint_id=source_salt,
+                        )
+                        modes.append(
+                            (
+                                "attention_guided",
+                                {"repair_suffix_blocks": guided.repair_blocks},
+                            )
+                        )
+                        row["attention_selected_suffix_offsets"] = (
+                            attention.select_suffix_offsets(
+                                end,
+                                row["predicted_dirty_tokens"],
+                                budget,
+                            )
+                        )
+                        row["attention_budget_fraction"] = args.attention_fraction
+                for mode, options in modes:
                     item = {"mode": mode, "status": "running"}
                     row["modes"].append(item)
                     persist()
@@ -211,10 +321,8 @@ def validate(args, report, persist):
                         len(replacement),
                         16,
                         blocks
-                        if mode in ("full", "all_blocks")
-                        else selected
-                        if mode == "selective"
-                        else [],
+                        if mode == "full"
+                        else options.get("repair_suffix_blocks", []),
                     )
                     expected_positions = list(range(start, suffix_start))
                     expected_positions += [
@@ -223,7 +331,9 @@ def validate(args, report, persist):
                     item["forward_positions"] = forwards
                     if forwards != expected_positions:
                         raise AssertionError("Unexpected recomputation positions.")
-                    if mode in ("full", "all_blocks"):
+                    if mode in ("full", "all_blocks") or set(plan.repair_blocks) == set(
+                        blocks
+                    ):
                         item["max_abs_error_vs_fresh"] = compare(actual, fresh)
                     reused = [
                         p
@@ -285,9 +395,23 @@ def main():
     )
     parser.add_argument("--results-dir", type=Path, required=True)
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--drift-profile", type=Path)
+    parser.add_argument("--attention-fraction", type=float)
+    parser.add_argument("--attention-query-positions", type=int, nargs="+")
+    parser.add_argument("--attention-layers", nargs="+")
     parser.add_argument("--atol", type=float, default=0.03)
     parser.add_argument("--rtol", type=float, default=0.03)
     args = parser.parse_args()
+    if args.attention_fraction is not None and (
+        not args.drift_profile or not 0 <= args.attention_fraction <= 1
+    ):
+        parser.error(
+            "Attention capture needs --drift-profile and a fraction in [0, 1]."
+        )
+    if (
+        args.attention_query_positions or args.attention_layers
+    ) and args.attention_fraction is None:
+        parser.error("Attention query/layer selection needs --attention-fraction.")
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
     args.results_dir.mkdir(parents=True, exist_ok=True)
@@ -310,8 +434,11 @@ def main():
         str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
         for p in [
             root / "vllm/v1/core/patchkv.py",
+            root / "vllm/v1/core/patchkv_profile.py",
+            root / "vllm/v1/core/patchkv_attention.py",
             root / "vllm/v1/core/kv_cache_edit.py",
             root / "vllm/v1/worker/kv_cache_edit.py",
+            root / "vllm/v1/worker/patchkv_attention.py",
             Path(__file__),
         ]
     }
