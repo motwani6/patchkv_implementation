@@ -63,7 +63,7 @@ def inspect_environment(root, gpu=False):
         matrix = torch.ones(16, 16, device="cuda", dtype=torch.float16)
         if (matrix @ matrix)[0, 0].item() != 16:
             raise RuntimeError("FP16 CUDA matmul compatibility check failed.")
-        import vllm._C  # noqa: F401
+        import vllm._C_stable_libtorch  # noqa: F401
 
         import vllm
         from vllm import LLM
