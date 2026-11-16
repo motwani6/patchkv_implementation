@@ -51,7 +51,7 @@ def validate(args, report, persist):
     if (x @ x)[0, 0].item() != 16:
         raise RuntimeError("CUDA matmul smoke check failed.")
     torch.cuda.synchronize()
-    import vllm._C  # noqa: F401
+    import vllm._C_stable_libtorch  # noqa: F401
 
     import vllm
     from vllm import LLM, SamplingParams
